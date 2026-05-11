@@ -1301,6 +1301,7 @@ async function _handleChatCompletionsInner(body, context = {}) {
   let messages = body.messages;
   const callerKey = context.callerKey || body.__callerKey || '';
   const cachePolicy = body.__cachePolicy || null;
+  const forceTextResponse = !!body.__forceTextResponse;
   const checkMessageRateLimitFn = context.checkMessageRateLimit || checkMessageRateLimit;
   const waitForAccountFn = context.waitForAccount || waitForAccount;
 
@@ -1439,6 +1440,9 @@ async function _handleChatCompletionsInner(body, context = {}) {
   const hasTools = Array.isArray(tools) && tools.length > 0;
   const hasToolHistory = Array.isArray(messages) && messages.some(m => m?.role === 'tool' || (m?.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length));
   const emulateTools = useCascade && (hasTools || hasToolHistory);
+  if (forceTextResponse && emulateTools) {
+    log.info(`Chat[${reqId}]: forceTextResponse enabled — preserving tool history but suppressing output tool_call parsing`);
+  }
 
   // v2.0.66 (#115) — partition-mode native tool bridge.
   //
@@ -1461,7 +1465,7 @@ async function _handleChatCompletionsInner(body, context = {}) {
     modelKey: routingModelKey,
     provider: modelInfo?.provider || null,
     route: body.__route || 'chat',
-  });
+  }) && !forceTextResponse;
   const nativeAdditionalSteps = nativeBridgeOn
     ? buildAdditionalStepsFromHistory(messages || [])
     : [];
@@ -1472,7 +1476,7 @@ async function _handleChatCompletionsInner(body, context = {}) {
     : [];
   // Tools we ship to the emulation toolPreamble: the unmapped subset when
   // bridge is on, or the full tools[] when bridge is off (legacy behaviour).
-  const emulationTools = nativeBridgeOn ? toolPartition.unmapped : (tools || []);
+  const emulationTools = forceTextResponse ? [] : nativeBridgeOn ? toolPartition.unmapped : (tools || []);
   const nativeCallerTools = nativeBridgeOn ? toolPartition.mapped : [];
   if (nativeBridgeOn) {
     const mappedNames = toolPartition.mapped.map(t => t?.function?.name).join(',') || '(none)';
@@ -1584,7 +1588,7 @@ async function _handleChatCompletionsInner(body, context = {}) {
       return true;
     });
   } else if (emulateTools) {
-    cascadeMessages = normalizeMessagesForCascade(messages, tools, {
+    cascadeMessages = normalizeMessagesForCascade(messages, forceTextResponse ? [] : tools, {
       injectUserPreamble: !disableUserToolFallback,
       modelKey: routingModelKey,
       provider: modelInfo?.provider || null,
@@ -1753,6 +1757,7 @@ async function _handleChatCompletionsInner(body, context = {}) {
       tools,
       route: body.__route || 'chat',
       nativeOpts,
+      forceTextResponse,
       context,
     });
   }
@@ -1971,6 +1976,7 @@ async function _handleChatCompletionsInner(body, context = {}) {
       // next identical original-model request hits cache instead of
       // re-burning the rate-limit + fallback cycle.
       context.__originalCkey || null,
+      { forceTextResponse },
     );
     if (result.status === 200) return result;
     reuseEntry = null; // don't try to reuse on the retry
@@ -2098,8 +2104,9 @@ async function _handleChatCompletionsInner(body, context = {}) {
   return lastErr || { status: 503, body: { error: { message: 'No active accounts available', type: 'pool_exhausted' } } };
 }
 
-async function nonStreamResponse(client, id, created, model, modelKey, messages, cascadeMessages, modelEnum, modelUid, useCascade, apiKey, ckey, poolCtx, provider, emulateTools, toolPreamble, wantJson = false, cachePolicy = null, wantThinking = false, tools = [], route = 'chat', nativeOpts = null, aliasCkey = null) {
+async function nonStreamResponse(client, id, created, model, modelKey, messages, cascadeMessages, modelEnum, modelUid, useCascade, apiKey, ckey, poolCtx, provider, emulateTools, toolPreamble, wantJson = false, cachePolicy = null, wantThinking = false, tools = [], route = 'chat', nativeOpts = null, aliasCkey = null, opts = {}) {
   const startTime = Date.now();
+  const forceTextResponse = !!opts.forceTextResponse;
   const nativeBridgeOn = !!nativeOpts?.enabled;
   try {
     let allText = '';
@@ -2131,7 +2138,7 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
         generatorOffset: chunks.generatorOffset,
       };
       serverUsage = chunks.usage || null;
-      if (nativeBridgeOn) {
+      if (nativeBridgeOn && !forceTextResponse) {
         // v2.0.65: planner-native trajectory steps come back via
         // chunks.toolCalls with `cascade_native: true`. Translate each
         // back into the caller's OpenAI tool name + the schema the caller
@@ -2165,7 +2172,7 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
         if (toolCalls.length === 0 && (chunks.toolCalls || []).length > 0) {
           log.info(`Chat[non-stream]: nativeBridge=true received ${chunks.toolCalls.length} cascade tool calls but none mapped to caller tools (kinds=${chunks.toolCalls.map(tc => tc.name).join(',')})`);
         }
-      } else if (emulateTools) {
+      } else if (emulateTools && !forceTextResponse) {
         // Capture pre-parse text once for diagnostic logging — useful when
         // non-Claude models emit a tool call in a format the parser missed.
         // Sample only the first 240 chars to keep logs sane.
@@ -2342,7 +2349,7 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
             }
           }
         }
-      } else {
+      } else if (!forceTextResponse) {
         allText = stripToolMarkupFromText(allText);
       }
       // Built-in Cascade tool calls (chunks.toolCalls — edit_file, view_file,
@@ -2590,6 +2597,7 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
 function streamResponse(id, created, model, modelKey, provider, messages, cascadeMessages, modelEnum, modelUid, useCascade, ckey, emulateTools, toolPreamble, reqId, wantJson = false, callerKey = '', deps = {}) {
   const checkMessageRateLimitFn = deps.checkMessageRateLimit || checkMessageRateLimit;
   const waitForAccountFn = deps.waitForAccount || waitForAccount;
+  const forceTextResponse = !!deps.forceTextResponse;
   // Cache policy threads through deps because streamResponse is a top-level
   // helper, not a closure. Without this, lines that compute TTL hints or
   // attribute usage to ephemeral_5m_input_tokens / ephemeral_1h_input_tokens
@@ -2730,7 +2738,7 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
       // e.g. a half-read `<tool_call>` tag — can't corrupt the next
       // account's stream. `let` bindings so the retry loop below can
       // reassign.
-      let toolParser = useCascade ? new ToolCallStreamParser({
+      let toolParser = (useCascade && !forceTextResponse) ? new ToolCallStreamParser({
         parseBareJson: emulateTools,
         parseToolCode: emulateTools,
         modelKey,
@@ -2877,7 +2885,7 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
           // retry. Skip on attempt 0 — already fresh. hadSuccess=true
           // means we already emitted content so no retry happens anyway.
           if (attempt > 0 && !hadSuccess) {
-            if (useCascade) {
+            if (useCascade && !forceTextResponse) {
               toolParser = new ToolCallStreamParser({
                 parseBareJson: emulateTools,
                 parseToolCode: emulateTools,
@@ -3105,7 +3113,7 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
             // catches the tail case where collectedToolCalls is still
             // empty after stream end (e.g. final-sweep step came late);
             // dedupe by id so we never emit a tool_call twice.
-            if (nativeBridgeOn && cascadeResult?.toolCalls?.length && collectedToolCalls.length === 0) {
+            if (nativeBridgeOn && !forceTextResponse && cascadeResult?.toolCalls?.length && collectedToolCalls.length === 0) {
               const lookup = nativeOpts?.callerLookup || new Map();
               const nativeRaw = [];
               for (const raw of cascadeResult.toolCalls) {

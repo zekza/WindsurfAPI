@@ -292,6 +292,49 @@ function anthropicToOpenAI(body) {
 
 export { extractCachePolicy };
 
+function collectTextBlocks(content) {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return content
+    .filter(block => block?.type === 'text' && typeof block.text === 'string')
+    .map(block => block.text)
+    .join('\n');
+}
+
+export function isAnthropicConversationCompactionRequest(body) {
+  if (!body || !Array.isArray(body.messages)) return false;
+  let latestUserText = '';
+  for (let i = body.messages.length - 1; i >= 0; i--) {
+    const message = body.messages[i];
+    if (message?.role !== 'user') continue;
+    latestUserText = collectTextBlocks(message.content);
+    break;
+  }
+  const text = latestUserText.replace(/\s+/g, ' ').trim();
+  if (!text) return false;
+
+  const longConversation = body.messages.length >= 20 || text.length >= 10_000;
+  const exactCompaction = /\b(?:compact|compaction|condense|compress)\b.{0,120}\b(?:conversation|context|transcript|history|session)\b/i.test(text)
+    || /\b(?:conversation|context|transcript|history|session)\b.{0,120}\b(?:compact|compaction|condense|compress)\b/i.test(text);
+  const summaryOfConversation = /\b(?:create|generate|write|produce|provide)?\s*(?:a\s+)?(?:detailed\s+)?summary\s+of\s+(?:the\s+|this\s+|our\s+)?(?:conversation|context|chat|transcript|history|session)\b/i.test(text);
+  const summarizeConversation = /\bsummari[sz]e\s+(?:the\s+|this\s+|our\s+)?(?:conversation|context|chat|transcript|history|session)\b/i.test(text);
+  const claudeCodeHandoff = /\bsummary\b/i.test(text)
+    && /\b(?:user'?s explicit requests|previous actions|technical details|code patterns|architectural decisions|future instance|continue from)\b/i.test(text);
+  const zhCompaction = /(?:压缩|总结|摘要).{0,80}(?:会话|上下文|对话|历史)/.test(text)
+    || /(?:会话|上下文|对话|历史).{0,80}(?:压缩|总结|摘要)/.test(text);
+  const broadLongSummary = longConversation
+    && /\b(?:summary|summari[sz]e|compact|compaction|condense|compress)\b/i.test(text)
+    && /\b(?:conversation|context|transcript|history|session|previous messages)\b/i.test(text)
+    && /\b(?:so far|continue|resume|future|handoff|carry forward|previous)\b/i.test(text);
+
+  return exactCompaction
+    || summaryOfConversation
+    || summarizeConversation
+    || claudeCodeHandoff
+    || zhCompaction
+    || broadLongSummary;
+}
+
 export function annotateRiskyReadToolResult(content, { toolName = '', isError = false } = {}) {
   if (toolName !== 'Read' || typeof content !== 'string' || !content) return content;
   const lower = content.toLowerCase();
@@ -669,6 +712,12 @@ export async function handleMessages(body, context = {}) {
   const wantStream = !!body.stream;
   const openaiBody = anthropicToOpenAI(body);
   const chatHandler = context.handleChatCompletions || handleChatCompletions;
+  const forceTextResponse = isAnthropicConversationCompactionRequest(body);
+  if (forceTextResponse) {
+    log.info(`messages: conversation compaction detected; forcing plain-text response (messages=${Array.isArray(body.messages) ? body.messages.length : 0}, tools=${Array.isArray(body.tools) ? body.tools.length : 0})`);
+    delete openaiBody.tools;
+    delete openaiBody.tool_choice;
+  }
   // Augment callerKey with the per-user tag from metadata.user_id when
   // present so the cascade pool can isolate concurrent Claude Code users
   // sharing one API key. Bare API-key callers and other client SDKs that
@@ -679,7 +728,12 @@ export async function handleMessages(body, context = {}) {
     : context;
 
   if (!wantStream) {
-    const result = await chatHandler({ ...openaiBody, stream: false, __route: 'messages' }, effectiveContext);
+    const result = await chatHandler({
+      ...openaiBody,
+      stream: false,
+      __route: 'messages',
+      ...(forceTextResponse ? { __forceTextResponse: true } : {}),
+    }, effectiveContext);
     if (result.status !== 200) {
       return {
         status: result.status,
@@ -698,7 +752,12 @@ export async function handleMessages(body, context = {}) {
   // Streaming path — ask handleChatCompletions for its streaming handler and
   // point its writes at our translator shim. This lets the upstream Cascade
   // poll loop drive the downstream SSE in real time — no buffer-then-replay.
-  const streamResult = await chatHandler({ ...openaiBody, stream: true, __route: 'messages' }, effectiveContext);
+  const streamResult = await chatHandler({
+    ...openaiBody,
+    stream: true,
+    __route: 'messages',
+    ...(forceTextResponse ? { __forceTextResponse: true } : {}),
+  }, effectiveContext);
 
   if (!streamResult.stream) {
     // The OpenAI path returned a non-stream error (e.g. 403 model_not_entitled)

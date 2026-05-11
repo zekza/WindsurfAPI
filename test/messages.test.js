@@ -1,6 +1,6 @@
 import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { annotateRiskyReadToolResult, extractCallerSubKey, handleMessages } from '../src/handlers/messages.js';
+import { annotateRiskyReadToolResult, extractCallerSubKey, handleMessages, isAnthropicConversationCompactionRequest } from '../src/handlers/messages.js';
 import { applyJsonResponseHint, extractRequestedJsonKeys, isExplicitJsonRequested, stabilizeJsonPayload } from '../src/handlers/chat.js';
 
 function chatChunk(chunk) {
@@ -187,6 +187,85 @@ describe('Anthropic messages request translation', () => {
     assert.match(out, /does not prove the full file body/);
   });
 
+  it('forces Claude CLI conversation compaction requests to plain text', async () => {
+    let capturedBody = null;
+    const result = await handleMessages({
+      model: 'claude-sonnet-4.6',
+      tools: [{ name: 'Read', description: 'read files', input_schema: { type: 'object' } }],
+      tool_choice: { type: 'auto' },
+      messages: [
+        { role: 'user', content: 'Build the feature' },
+        { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_1', name: 'Read', input: { file_path: 'src/index.js' } }] },
+        { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: 'const x = 1;' }] },
+        { role: 'user', content: 'Create a detailed summary of the conversation so far for a future instance to continue from.' },
+      ],
+    }, {
+      async handleChatCompletions(body) {
+        capturedBody = body;
+        return {
+          status: 200,
+          body: {
+            model: body.model,
+            choices: [{
+              index: 0,
+              message: {
+                role: 'assistant',
+                content: '<tool_call>{"name":"Read","arguments":{"file_path":"package.json"}}</tool_call>\nSummary text.',
+              },
+              finish_reason: 'stop',
+            }],
+            usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+          },
+        };
+      },
+    });
+
+    assert.equal(capturedBody.__forceTextResponse, true);
+    assert.equal(capturedBody.tools, undefined);
+    assert.equal(capturedBody.tool_choice, undefined);
+    assert.equal(result.body.stop_reason, 'end_turn');
+    assert.deepEqual(result.body.content, [{
+      type: 'text',
+      text: '<tool_call>{"name":"Read","arguments":{"file_path":"package.json"}}</tool_call>\nSummary text.',
+    }]);
+  });
+
+  it('does not keep forcing plain text after compaction when the next user asks to continue', async () => {
+    let capturedBody = null;
+    await handleMessages({
+      model: 'claude-sonnet-4.6',
+      tools: [{ name: 'Read', description: 'read files', input_schema: { type: 'object' } }],
+      messages: [
+        { role: 'assistant', content: 'Summary of the conversation so far for a future instance to continue from. Previous actions: read files and ran tests.' },
+        { role: 'user', content: '继续' },
+      ],
+    }, {
+      async handleChatCompletions(body) {
+        capturedBody = body;
+        return {
+          status: 200,
+          body: {
+            model: body.model,
+            choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+          },
+        };
+      },
+    });
+
+    assert.equal(capturedBody.__forceTextResponse, undefined);
+    assert.equal(capturedBody.tools.length, 1);
+    assert.equal(capturedBody.tools[0].function.name, 'Read');
+  });
+
+  it('does not force plain text for normal file summarization requests', () => {
+    assert.equal(isAnthropicConversationCompactionRequest({
+      model: 'claude-sonnet-4.6',
+      tools: [{ name: 'Read', input_schema: { type: 'object' } }],
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'Summarize package.json' }] }],
+    }), false);
+  });
+
   it('translates Anthropic output_config.effort into reasoning_effort', async () => {
     let capturedBody = null;
     await handleMessages({
@@ -325,7 +404,7 @@ describe('Anthropic messages request translation', () => {
     assert.equal(capturedContext.callerKey, 'api:abc123');
   });
 
-  it('drops Anthropic server-side tool types (advisor / web_search / code_execution) before forwarding', async () => {
+  it('drops unsupported Anthropic server-side tools and converts web_search before forwarding', async () => {
     let capturedBody = null;
     await handleMessages({
       model: 'claude-sonnet-4.6',
@@ -348,12 +427,13 @@ describe('Anthropic messages request translation', () => {
         };
       },
     });
-    // Only the client-side Read tool survives translation; all three
-    // server-side types must be stripped.
-    assert.equal(capturedBody.tools?.length, 1);
-    assert.equal(capturedBody.tools[0].function.name, 'Read');
+    // Read survives as a client-side tool; web_search is converted to the
+    // supported function-tool bridge; advisor/code_execution stay stripped.
+    assert.equal(capturedBody.tools?.length, 2);
     const names = capturedBody.tools.map(t => t.function.name);
-    for (const banned of ['advisor', 'web_search', 'code_execution']) {
+    assert.equal(names.includes('Read'), true);
+    assert.equal(names.includes('web_search'), true);
+    for (const banned of ['advisor', 'code_execution']) {
       assert.equal(names.includes(banned), false, `${banned} should not be forwarded`);
     }
   });
