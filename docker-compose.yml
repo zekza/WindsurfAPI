@@ -4,7 +4,7 @@ services:
     # `build:` is kept for local dev: `docker compose up --build` rebuilds from source,
     # and Compose will fall back to building when the image isn't available locally
     # AND can't be pulled (e.g. before the first stable tag exists, or on a fork).
-    image: ${WINDSURF_API_IMAGE:-ghcr.io/zekza/windsurf-api:2.0.94-sub2api.2}
+    image: ${WINDSURF_API_IMAGE:-ghcr.io/zekza/windsurf-api:2.0.94-sub2api.3}
     build:
       context: .
       dockerfile: Dockerfile

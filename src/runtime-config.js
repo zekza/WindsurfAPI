@@ -17,6 +17,10 @@ import { config, log } from './config.js';
 
 const FILE = resolve(config.dataDir, 'runtime-config.json');
 
+export const TASK_COMPLETION_STOP_GUIDANCE = 'When the requested task is complete, provide a concise Summary in the user\'s language, then stop. Do not call additional tools after the Summary unless the latest user message explicitly asks for more work. Do not repeat completed analysis or re-run tools for already completed checks.';
+const COMMUNICATION_WITH_TOOLS_V1 = 'You are accessed via API. When asked about your identity, describe your actual underlying model name and provider accurately. STRICTLY respond in the exact same language the user used in their latest message (Chinese → Chinese, English → English, Japanese → Japanese; never switch mid-conversation). Use the functions above when relevant.';
+const COMMUNICATION_WITH_TOOLS_DEFAULT = `${COMMUNICATION_WITH_TOOLS_V1} ${TASK_COMPLETION_STOP_GUIDANCE}`;
+
 const DEFAULTS = {
   experimental: {
     // Reuse Cascade cascade_id across multi-turn requests when the history
@@ -55,7 +59,7 @@ const DEFAULTS = {
   // Editable from Dashboard so users can tune without code changes.
   systemPrompts: {
     toolReinforcement: 'The functions listed above are available and callable. When the user\'s request can be answered by calling a function, emit a <tool_call> block as described. Use this exact format: <tool_call>{"name":"...","arguments":{...}}</tool_call>',
-    communicationWithTools: 'You are accessed via API. When asked about your identity, describe your actual underlying model name and provider accurately. STRICTLY respond in the exact same language the user used in their latest message (Chinese → Chinese, English → English, Japanese → Japanese; never switch mid-conversation). Use the functions above when relevant.',
+    communicationWithTools: COMMUNICATION_WITH_TOOLS_DEFAULT,
     communicationNoTools: 'You are accessed via API. When asked about your identity, describe your actual underlying model name and provider accurately. Answer directly. STRICTLY respond in the exact same language the user used in their latest message (Chinese → Chinese, English → English, Japanese → Japanese; never switch mid-conversation).',
   },
   // v2.0.56 — runtime-rotatable credentials. When set, override the
@@ -98,6 +102,10 @@ function load() {
   try {
     const raw = JSON.parse(readFileSync(FILE, 'utf-8'));
     _state = deepMerge(DEFAULTS, raw);
+    if (_state.systemPrompts?.communicationWithTools === COMMUNICATION_WITH_TOOLS_V1) {
+      _state.systemPrompts.communicationWithTools = COMMUNICATION_WITH_TOOLS_DEFAULT;
+      persist();
+    }
   } catch (e) {
     log.warn(`runtime-config: failed to load ${FILE}: ${e.message}`);
   }
@@ -292,4 +300,3 @@ import('./auth.js').then(m => {
     m.setDroughtRestrictResolver(() => isExperimentalEnabled('droughtRestrictPremium'));
   }
 }).catch(() => { /* auth not yet ready, validateApiKey falls back to env */ });
-
