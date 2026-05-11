@@ -80,6 +80,19 @@ describe('LS binary update endpoint (#7/#10/#49/#87)', () => {
     assert.match(LS_JS, /export function _poolKeys\(\)/);
     assert.match(LS_JS, /export function getProxyByKey\(key\)/);
   });
+
+  test('intentional LS restarts are not re-spawned by crash auto-restart', () => {
+    assert.match(LS_JS, /LS_AUTO_RESTART/,
+      'auto-restart should be configurable by environment');
+    assert.match(LS_JS, /export function getRestartStats\(\)/,
+      'restart attempts should be observable');
+    assert.match(LS_JS, /const _intentionalShutdown = new WeakSet\(\)/,
+      'intentional shutdown tracking should be process-scoped');
+    assert.match(LS_JS, /_intentionalShutdown\.add\(entry\.process\)/,
+      'restartLsForProxy and stop paths must mark killed processes intentional');
+    assert.match(LS_JS, /scheduleLsRestart\(key, gone\.proxy\)/,
+      'unexpected LS exits should schedule a replacement');
+  });
 });
 
 // User report (2026-05-01): "LS update has no effect" — the toast

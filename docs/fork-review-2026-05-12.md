@@ -139,10 +139,79 @@
 - `docker-compose.yml`
   - 保留 sub2api 外部网络接入和本机端口绑定。
 
+从 PR / 其它 fork 适配合入：
+
+- `dwgx/WindsurfAPI#163`（作者 fork：`you922/WindsurfAPI`）
+  - 主题：Language Server 非预期崩溃后自动重启。
+  - 合入方式：按当前 `src/langserver.js` 结构手动适配，而不是直接 cherry-pick。
+  - 当前实现：
+    - 新增 `LS_AUTO_RESTART`、`LS_AUTO_RESTART_MAX_RETRIES`、`LS_AUTO_RESTART_BASE_DELAY_MS`。
+    - 默认开启，最多重试 3 次，退避基准 1000ms。
+    - 非预期退出时关闭旧 HTTP/2 session、失效对应 conversation pool，并调度重启。
+    - 使用 `WeakSet` 按进程对象标记主动关闭，避免 `restartLsForProxy()`、`stopLanguageServer()`、`stopLanguageServerAndWait()` 被误判为崩溃后又自动拉起。
+    - 导出 `getRestartStats()`，并在 `getLsStatus()` 中暴露 `restartAttempts`。
+  - 合入理由：和 sub2api/Claude Code 稳定性直接相关。LS 崩溃或被上游连接中断时，不会长期留下死池导致后续请求持续 `ECONNRESET` / `ERR_HTTP2_CONNECT`。
+
+- `UntaDotMy/WindsurfAPI` 的 `247e75b` / 合并提交 `9baf2e2`
+  - 主题：避免 Cascade final sweep 阶段重复输出 `modified_response`。
+  - 当前实现：
+    - `src/client.js` 新增 `modifiedTextTopUpDelta()`。
+    - final sweep 只补真实新增尾部；如果 LS 把 `modified_response` 变成 `response + response` 这类重复文本，则跳过。
+    - `test/client-content.test.js` 增加重复和真实扩展两类回归测试。
+  - 合入理由：影响面小，能减少 Claude Code/客户端收到重复总结或重复尾部文本的概率。
+
+## PR 检查记录
+
+来源：`gh pr list --repo dwgx/WindsurfAPI --state open --limit 50`
+
+| PR | 标题 | 结论 | 原因 |
+| --- | --- | --- | --- |
+| #173 | `refactor(dashboard): UI cleanup` | 暂不合入 | 只改控制台 UI，单文件大规模重构，和 Claude Code/sub2api 主路径无关，回归面较大。 |
+| #163 | `feat: auto-restart crashed language server with exponential backoff` | 已适配合入 | LS 崩溃恢复直接影响服务稳定性，改动边界集中在 `src/langserver.js`。 |
+| #162 | `feat: sticky session for multi-turn conversation continuity` | 暂不合入 | 默认关闭但改动账号选择链路；当前代码已有 `callerKey`、conversation pool、`acquireAccountByKey()` 复用机制。该 PR 可作为后续专项评估候选，不应和本次稳定性修复混合。 |
+| #161 | `fix(dashboard): dashboard account management page width adaptive` | 不合入 | 控制台宽度调整价值有限；同时包含注释掉私网 IP 检查的变更，会削弱代理安全边界。 |
+
+## 其它近期 fork 补充检查
+
+### UntaDotMy/WindsurfAPI
+
+- Codex Responses WebSocket、sticky routing、narrated tool retry、exec inventory 等 Codex 专用功能：
+  - 结论：暂不合入。
+  - 原因：目标客户端是 Claude Code 通过 sub2api 接入，不是 Codex；其中部分工具恢复逻辑可能增加“模型继续调用工具”的倾向。
+- `247e75b Avoid duplicate Cascade modified-response top-up`：
+  - 结论：已适配合入。
+  - 原因：小范围输出去重，风险可控。
+
+### LeevianChang/WindsurfAPI
+
+- `467afe1 feat：前端优化，增加配置，限流直接返回错误`
+  - 内容：增加 `AUTO_DISABLE_RATE_LIMITED`，账号限流后可直接返回 429，不继续切换其它账号。
+  - 结论：暂不合入。
+  - 价值：当多个账号共用同一代理并被整体限流时，可以避免连续打穿账号池。
+  - 风险：会牺牲账号池自动换号能力；是否适合取决于实际账号/代理拓扑，应单独配置化评估。
+- `99a7569 fix: 不自动启动default ls`
+  - 结论：暂不合入。
+  - 价值：可降低冷启动资源占用。
+  - 风险：当前部署需要稳定响应 Claude Code 请求，默认 LS 启动策略和健康检查、控制台状态、首次请求延迟相关，不适合顺手合并。
+- `24e775a`、`0d73eb3` 工具 JSON 流式 parser 修复：
+  - 结论：暂不合入。
+  - 原因：当前上游已有较完整的 tool-emulation/NLU recovery 管线；继续增强工具 JSON salvage 可能扩大“任务结束后又继续工具调用”的误触发面。
+
+## 关于 Claude Code “总结后继续执行”的当前判断
+
+- 已从日志观察到服务端请求正常结束，`Cascade done reason=idle_done`，nginx `/v1/messages` 返回 `200`。
+- 同一时间附近出现 `ToolParser: matched xml format, name=Glob/Read/AskUserQuestion`，说明服务端给 Claude Code 返回的是可执行工具调用，而不是 SSE 没结束。
+- 本次已合入的 compact 修复能解决“compact/summary 请求里的工具形状文本被误解析为工具调用”的一类问题。
+- 如果不是 compact 回合，而是模型在普通任务末尾主动生成 `tool_use`，fork 中暂未发现明确的“总结后强制等待用户”的现成修复。后续应优先从提示词/工具解析边界/结束态策略专项排查，而不是盲目合并更激进的 NLU/tool recovery 改动。
+
 ## 验证记录
 
 - `node --check src/handlers/messages.js && node --check src/handlers/chat.js`
 - `node --test test/messages.test.js test/chat-reuse.test.js test/tool-emulation.test.js test/tool-preamble-budget.test.js`
   - 结果：109/109 通过。
+- `node --check src/langserver.js`
+- `node --check src/client.js`
+- `node --test test/client-content.test.js test/langserver-redact.test.js test/langserver-binary-update.test.js`
+  - 结果：21/21 通过。
 - `git diff --check`
 - `docker compose config`

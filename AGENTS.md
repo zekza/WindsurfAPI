@@ -56,6 +56,27 @@
 
 该修复与用户反馈的 Claude Code “一个任务结束后未等待用户指令就继续执行”高度相关：compact/summary 响应中的 tool-shaped 文本可能被误解析为 `tool_use`，导致 Claude Code 继续执行。
 
+已从开放 PR / 近期 fork 适配合入以下稳定性修复：
+
+- `dwgx/WindsurfAPI#163`
+  - 主题：Language Server 非预期崩溃后自动重启。
+  - 当前实现位于 `src/langserver.js`。
+  - 环境变量：
+    - `LS_AUTO_RESTART=0` 可关闭，默认开启。
+    - `LS_AUTO_RESTART_MAX_RETRIES` 默认 `3`。
+    - `LS_AUTO_RESTART_BASE_DELAY_MS` 默认 `1000`。
+  - 主动关闭路径必须标记为 intentional shutdown，包括 `restartLsForProxy()`、`stopLanguageServer()`、`stopLanguageServerAndWait()`，避免更新或停服时被自动拉起。
+- `UntaDotMy/WindsurfAPI` 的 Cascade final sweep 输出去重修复：
+  - 当前实现位于 `src/client.js` 的 `modifiedTextTopUpDelta()`。
+  - 目的：过滤 `modified_response` 形如 `response + response` 的重复尾部，避免客户端看到重复总结。
+
+## PR 评估结论
+
+- `#163 feat: auto-restart crashed language server with exponential backoff`：已适配合入。
+- `#162 feat: sticky session for multi-turn conversation continuity`：暂不合入。它默认关闭但改动账号选择链路；当前仓库已有 `callerKey`、conversation pool 和 `acquireAccountByKey()` 复用机制，后续若要合并需做会话池专项审计。
+- `#173 refactor(dashboard): UI cleanup`：暂不合入。控制台 UI 大改，和 Claude Code/sub2api 主路径无关。
+- `#161 fix(dashboard): dashboard account management page width adaptive`：不合入。该 PR 同时注释掉私网 IP 检查，会削弱安全边界。
+
 ## 暂不建议直接合并的功能
 
 以下功能有潜在价值，但不应在没有专项审计和验证的情况下直接合并：
@@ -65,6 +86,14 @@
   - 相关提交：`ed55a5c`, `f7fed1b`, `79a1608`, `5e3ba04`
   - 可能改善 Claude Code 连续工具调用、复用 MISS、冷启动无输出重试等问题。
   - 风险：会改变 `conversation-pool` 复用语义；后续若再次出现 Claude Code 连续性异常，应单独审计这组改动。
+- Sticky Session：
+  - 来源：`dwgx/WindsurfAPI#162` / `you922/WindsurfAPI`
+  - 价值：绑定 caller/model 到同一账号，理论上可改善多轮会话换号导致的上下文丢失。
+  - 风险：改动账号选择链路，和当前 conversation pool 机制重叠；不要在没有专项测试时直接合入。
+- 限流直接返回 429：
+  - 来源：`LeevianChang/WindsurfAPI` 的 `AUTO_DISABLE_RATE_LIMITED`
+  - 价值：共用代理被整体限流时，避免连续尝试多个账号。
+  - 风险：牺牲账号池自动换号能力；是否启用取决于部署拓扑。
 - 首字延迟 / 可观测性日志：
   - 来源：`snakeeeeeeeee/WindsurfAPI`
   - 相关提交：`c30173f`, `f3f8f14`

@@ -24,12 +24,24 @@ const DEFAULT_CSRF = 'windsurf-api-csrf-fixed-token';
 const DEFAULT_API_URL = 'https://server.self-serve.windsurf.com';
 const DEFAULT_DATA_ROOT = '/opt/windsurf/data';
 
+const AUTO_RESTART_ENABLED = process.env.LS_AUTO_RESTART !== '0';
+const AUTO_RESTART_MAX_RETRIES = (() => {
+  const n = parseInt(process.env.LS_AUTO_RESTART_MAX_RETRIES || '', 10);
+  return Number.isFinite(n) && n > 0 ? n : 3;
+})();
+const AUTO_RESTART_BASE_DELAY_MS = (() => {
+  const n = parseInt(process.env.LS_AUTO_RESTART_BASE_DELAY_MS || '', 10);
+  return Number.isFinite(n) && n > 0 ? n : 1000;
+})();
+
 // Pool: key -> { process, port, csrfToken, proxy, startedAt, ready }
 const _pool = new Map();
 // In-flight Promise map so two concurrent ensureLs(proxy) calls for the
 // same key share one spawn + readiness wait. Without this, both callers
 // would each spawn an LS process, race on the port, and leave an orphan.
 const _pending = new Map();
+const _restartAttempts = new Map();
+const _intentionalShutdown = new WeakSet();
 let _nextPort = DEFAULT_PORT + 1;
 let _binaryPath = DEFAULT_BINARY;
 let _apiServerUrl = DEFAULT_API_URL;
@@ -347,8 +359,10 @@ export async function ensureLs(proxy = null) {
         log.error('  3. Binary corrupted — delete and re-download: rm ' + _binaryPath + ' && bash install-ls.sh');
         log.error('  4. Port already in use — check: lsof -i :' + port);
       }
-      const gone = _pool.get(key);
-      _pool.delete(key);
+      const current = _pool.get(key);
+      const gone = current?.process === proc ? current : entry;
+      const ownsPoolSlot = current?.process === proc;
+      if (ownsPoolSlot) _pool.delete(key);
       if (gone?.port) {
         // Drop the pooled HTTP/2 session so the next request to the
         // replacement LS opens a fresh one instead of writing into a
@@ -358,6 +372,11 @@ export async function ensureLs(proxy = null) {
         // already came up on the same port keeps its entries.
         const goneGen = gone.generation;
         import('./conversation-pool.js').then(m => m.invalidateFor({ lsPort: gone.port, lsGeneration: goneGen })).catch(() => {});
+      }
+      const intentional = _intentionalShutdown.has(proc);
+      _intentionalShutdown.delete(proc);
+      if (AUTO_RESTART_ENABLED && !intentional && ownsPoolSlot && gone) {
+        scheduleLsRestart(key, gone.proxy);
       }
     });
     proc.on('error', (err) => {
@@ -375,7 +394,7 @@ export async function ensureLs(proxy = null) {
       } else {
         log.error(`LS instance ${key} spawn error: ${err.message}`);
       }
-      _pool.delete(key);
+      if (_pool.get(key)?.process === proc) _pool.delete(key);
     });
 
     const entry = {
@@ -422,6 +441,7 @@ export async function restartLsForProxy(proxy) {
   const key = proxyKey(proxy);
   const entry = _pool.get(key);
   if (entry?.process) {
+    _intentionalShutdown.add(entry.process);
     try { entry.process.kill('SIGTERM'); } catch {}
   }
   if (entry?.port) {
@@ -448,6 +468,34 @@ export async function restartLsForProxy(proxy) {
  */
 export function getLsFor(proxy) {
   return _pool.get(proxyKey(proxy)) || null;
+}
+
+function scheduleLsRestart(key, proxy) {
+  const attempts = (_restartAttempts.get(key) || 0) + 1;
+  if (attempts > AUTO_RESTART_MAX_RETRIES) {
+    log.error(`LS auto-restart: ${key} exceeded max retries (${AUTO_RESTART_MAX_RETRIES}), giving up`);
+    _restartAttempts.delete(key);
+    return;
+  }
+
+  const delay = AUTO_RESTART_BASE_DELAY_MS * Math.pow(2, attempts - 1);
+  _restartAttempts.set(key, attempts);
+  log.info(`LS auto-restart: scheduling ${key} restart #${attempts} in ${delay}ms`);
+
+  setTimeout(async () => {
+    try {
+      await ensureLs(proxy);
+      _restartAttempts.delete(key);
+      log.info(`LS auto-restart: ${key} restarted successfully (attempt #${attempts})`);
+    } catch (err) {
+      log.error(`LS auto-restart: ${key} restart #${attempts} failed: ${err.message}`);
+      if (attempts < AUTO_RESTART_MAX_RETRIES) scheduleLsRestart(key, proxy);
+    }
+  }, delay).unref();
+}
+
+export function getRestartStats() {
+  return Object.fromEntries(_restartAttempts.entries());
 }
 
 /**
@@ -571,6 +619,7 @@ export function stopLanguageServer() {
   // cascade ids into the next LS's session window.
   const portsToClose = [];
   for (const [key, entry] of _pool) {
+    if (entry?.process) _intentionalShutdown.add(entry.process);
     try { entry.process?.kill('SIGTERM'); } catch {}
     if (entry?.port) portsToClose.push({ port: entry.port, generation: entry.generation });
     log.info(`LS instance ${key} stopped`);
@@ -603,6 +652,7 @@ export async function stopLanguageServerAndWait({ perProcessTimeoutMs = 1500 } =
   const portsToClose = [];
   for (const [key, entry] of _pool) {
     if (entry?.process) procs.push({ key, proc: entry.process });
+    if (entry?.process) _intentionalShutdown.add(entry.process);
     if (entry?.port) portsToClose.push({ port: entry.port, generation: entry.generation });
   }
   _pool.clear();
@@ -654,6 +704,7 @@ export function getLsStatus() {
     port: def?.port || DEFAULT_PORT,
     startedAt: def?.startedAt || null,
     restartCount: 0,
+    restartAttempts: getRestartStats(),
     instances: Array.from(_pool.entries()).map(([key, e]) => ({
       key, port: e.port,
       pid: e.process?.pid || null,
