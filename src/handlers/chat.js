@@ -98,6 +98,24 @@ function shortHash(text) {
   return createHash('sha256').update(String(text || '')).digest('hex').slice(0, 16);
 }
 
+function accountLogTag(acct) {
+  if (!acct) return 'none';
+  const key = acct.apiKey ? `key:${shortHash(acct.apiKey)}` : 'key:none';
+  const email = acct.email ? `email:${shortHash(acct.email)}` : 'email:none';
+  return `${key}/${email}`;
+}
+
+function toolHistoryStats(messages) {
+  const stats = { toolResults: 0, assistantToolCalls: 0 };
+  for (const m of messages || []) {
+    if (m?.role === 'tool') stats.toolResults++;
+    if (m?.role === 'assistant' && Array.isArray(m.tool_calls)) {
+      stats.assistantToolCalls += m.tool_calls.length;
+    }
+  }
+  return stats;
+}
+
 // v2.0.55 (audit M2): salvage parser will accept any
 // `{"name":"X","arguments":{...}}` JSON it finds in model output. If a user
 // message contains a prompt-injection payload (and a non-Claude model
@@ -1304,6 +1322,8 @@ async function _handleChatCompletionsInner(body, context = {}) {
   const forceTextResponse = !!body.__forceTextResponse;
   const checkMessageRateLimitFn = context.checkMessageRateLimit || checkMessageRateLimit;
   const waitForAccountFn = context.waitForAccount || waitForAccount;
+  const callerTag = callerKey ? shortHash(callerKey) : 'none';
+  const initialToolStats = toolHistoryStats(messages);
 
   // Probe diagnostics: dump compact request shape for every call, plus a
   // tail of the last user turn. Keeps us able to see how third-party
@@ -1322,7 +1342,7 @@ async function _handleChatCompletionsInner(body, context = {}) {
           : Array.isArray(c) ? c.filter(p => p?.type === 'text').map(p => p.text || '').join(' ') : '';
       }
     }
-    log.info(`Probe[${reqId}]: model=${reqModel} stream=${!!stream} rf=${response_format?.type || 'none'} tools=${Array.isArray(tools) ? tools.length : 0} reasoning=${body.reasoning_effort || body.thinking?.type || 'none'} ctypes=[${[...contentTypes].join(',')}] turns=${messages?.length || 0} lastUser=${requestLogSummary(lastUserText, 140)}`);
+    log.info(`Probe[${reqId}]: model=${reqModel} stream=${!!stream} route=${body.__route || 'chat'} caller=${callerTag} scoped=${hasPerUserScope(callerKey) ? 1 : 0} rf=${response_format?.type || 'none'} tools=${Array.isArray(tools) ? tools.length : 0} toolResults=${initialToolStats.toolResults} assistantToolCalls=${initialToolStats.assistantToolCalls} reasoning=${body.reasoning_effort || body.thinking?.type || 'none'} ctypes=[${[...contentTypes].join(',')}] turns=${messages?.length || 0} lastUser=${requestLogSummary(lastUserText, 140)}`);
     // Also dump first-user / system content so we can see preambles.
     for (let mi = 0; mi < Math.min((messages || []).length, 3); mi++) {
       const m = messages[mi];
@@ -1804,13 +1824,13 @@ async function _handleChatCompletionsInner(body, context = {}) {
   // and replaying the entire history. Critical for diagnosing
   // "model keeps re-analysing the same data" loops.
   if (reuseEnabled) {
-    log.info(`Chat[${reqId}]: reuse fp=${fpBefore?.slice(0, 12) || 'none'} ${reuseEntry ? `HIT cascade=${reuseEntry.cascadeId.slice(0, 8)}` : 'MISS'} turns=${(messages || []).length} model=${routingModelKey}`);
+    log.info(`Chat[${reqId}]: reuse fp=${fpBefore?.slice(0, 12) || 'none'} ${reuseEntry ? `HIT cascade=${reuseEntry.cascadeId.slice(0, 8)} owner=${shortHash(reuseEntry.apiKey || '')}` : 'MISS'} caller=${callerTag} turns=${(messages || []).length} toolResults=${initialToolStats.toolResults} assistantToolCalls=${initialToolStats.assistantToolCalls} model=${routingModelKey}`);
   } else if (sharedApiKeyNoScope) {
-    log.info(`Chat[${reqId}]: reuse DISABLED (shared API key, no per-user scope)`);
+    log.info(`Chat[${reqId}]: reuse DISABLED caller=${callerTag} (shared API key, no per-user scope)`);
   } else if (!shouldUseCascadeReuse({ useCascade, emulateTools, modelKey: routingModelKey })) {
-    log.info(`Chat[${reqId}]: reuse DISABLED (model ineligible)`);
+    log.info(`Chat[${reqId}]: reuse DISABLED caller=${callerTag} (model ineligible)`);
   } else {
-    log.info(`Chat[${reqId}]: reuse DISABLED (experimental.cascadeConversationReuse=off)`);
+    log.info(`Chat[${reqId}]: reuse DISABLED caller=${callerTag} (experimental.cascadeConversationReuse=off)`);
   }
   // v2.0.25 HIGH-2: a SendUserCascadeMessage that hit "cascade not found"
   // marks the entry dead — any restore path further down must drop it
@@ -1956,7 +1976,7 @@ async function _handleChatCompletionsInner(body, context = {}) {
       const c = m?.content;
       return n + (typeof c === 'string' ? c.length : Array.isArray(c) ? c.reduce((k, p) => k + (typeof p?.text === 'string' ? p.text.length : 0), 0) : 0);
     }, 0);
-    log.info(`Chat[${reqId}]: model=${displayModel} flow=${useCascade ? 'cascade' : 'legacy'} attempt=${attempt + 1} account=${acct.email} ls=${ls.port} turns=${(messages||[]).length} chars=${_msgChars}${reuseEntry ? ' reuse=1' : ''}${emulateTools ? ' tools=emu' : ''}`);
+    log.info(`Chat[${reqId}]: model=${displayModel} flow=${useCascade ? 'cascade' : 'legacy'} attempt=${attempt + 1} account=${accountLogTag(acct)} ls=${ls.port} caller=${callerTag} turns=${(messages||[]).length} chars=${_msgChars}${reuseEntry ? ' reuse=1' : ''}${emulateTools ? ' tools=emu' : ''}`);
     const client = new WindsurfClient(acct.apiKey, ls.port, ls.csrfToken);
     const result = await nonStreamResponse(
       client, chatId, created, displayModel, routingModelKey, messages, cascadeMessages, modelEnum, modelUid,
@@ -2724,6 +2744,17 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
       const fpBefore = reuseEnabled ? fingerprintBefore(messages, modelKey, callerKey, fpOpts) : null;
       let reuseEntry = reuseEnabled ? poolCheckout(fpBefore, callerKey) : null;
       let checkedOutReuseEntry = reuseEntry;
+      const callerTag = callerKey ? shortHash(callerKey) : 'none';
+      const streamToolStats = toolHistoryStats(messages);
+      if (reuseEnabled) {
+        log.info(`Chat[${reqId}]: reuse fp=${fpBefore?.slice(0, 12) || 'none'} ${reuseEntry ? `HIT cascade=${reuseEntry.cascadeId.slice(0, 8)} owner=${shortHash(reuseEntry.apiKey || '')}` : 'MISS'} caller=${callerTag} stream=1 turns=${(messages || []).length} toolResults=${streamToolStats.toolResults} assistantToolCalls=${streamToolStats.assistantToolCalls} model=${modelKey}`);
+      } else if (sharedApiKeyNoScopeStream) {
+        log.info(`Chat[${reqId}]: reuse DISABLED caller=${callerTag} stream=1 (shared API key, no per-user scope)`);
+      } else if (!shouldUseCascadeReuse({ useCascade, emulateTools, modelKey })) {
+        log.info(`Chat[${reqId}]: reuse DISABLED caller=${callerTag} stream=1 (model ineligible)`);
+      } else {
+        log.info(`Chat[${reqId}]: reuse DISABLED caller=${callerTag} stream=1 (experimental.cascadeConversationReuse=off)`);
+      }
       // v2.0.25 HIGH-2: same dead-entry signal as the non-stream path.
       let reuseEntryDead = false;
       if (reuseEntry) log.info(`Chat: cascade reuse HIT cascadeId=${reuseEntry.cascadeId.slice(0, 8)}… stream model=${model}`);
@@ -3000,7 +3031,7 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
             const c = m?.content;
             return n + (typeof c === 'string' ? c.length : Array.isArray(c) ? c.reduce((k, p) => k + (typeof p?.text === 'string' ? p.text.length : 0), 0) : 0);
           }, 0);
-          log.info(`Chat: model=${model} flow=${useCascade ? 'cascade' : 'legacy'} stream=true attempt=${attempt + 1} account=${acct.email} ls=${ls.port} turns=${(messages||[]).length} chars=${_msgCharsStream}${reuseEntry ? ' reuse=1' : ''}`);
+          log.info(`Chat[${reqId}]: model=${model} flow=${useCascade ? 'cascade' : 'legacy'} stream=true attempt=${attempt + 1} account=${accountLogTag(acct)} ls=${ls.port} caller=${callerTag} turns=${(messages||[]).length} chars=${_msgCharsStream}${reuseEntry ? ' reuse=1' : ''}${emulateTools ? ' tools=emu' : ''}`);
           const client = new WindsurfClient(acct.apiKey, ls.port, ls.csrfToken);
           let cascadeResult = null;
           try {

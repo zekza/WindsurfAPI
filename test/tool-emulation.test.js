@@ -630,6 +630,10 @@ describe('normalizeMessagesForCascade (preamble placement regression)', () => {
     assert.equal(last.role, 'user');
     assert.ok(last.content.startsWith('<tool_result'),
       `expected pure tool_result wrapper, got: ${last.content.slice(0, 80)}`);
+    assert.ok(last.content.includes('not a new user request'),
+      'tool_result turn must explicitly say it is not a fresh user request');
+    assert.ok(last.content.includes('provide the final answer and stop'),
+      'tool_result turn must bias the model toward final answer when sufficient');
     assert.ok(!last.content.includes('Tools available this turn:'),
       'tool_result turn must not be polluted with the user-message preamble');
   });
