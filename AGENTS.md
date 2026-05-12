@@ -92,6 +92,23 @@
   - 跳过 `#173`。
   - 跳过官方 `#163`，因为本地已有等价实现。
 
+## 后续版本更新要求
+
+- 后续每次同步官方上游、fork 或 PR 时，必须先记录“当前本地版本 vs 目标上游版本”的差异，不能直接 merge。
+- 固定流程：
+  1. `git fetch origin --tags`，确认官方最新 tag、当前本地 tag、当前分支 HEAD。
+  2. 用 `git log --oneline --decorate <local-base>..origin/master` 或指定 tag 范围列出新增提交。
+  3. 对每个新增提交 / PR 记录：功能目的、涉及文件、是否已被本地实现覆盖、与 sub2api/Claude Code 主路径的关系、风险和取舍结论。
+  4. 只选择性集成适合本项目的实现；如果上游实现和本地实现都能解决同一问题，评审两边代码后保留更稳、更小、更贴合当前架构的一种。
+  5. 不整体合并会覆盖本地专项内容的上游分支，尤其注意 `AGENTS.md`、`docs/fork-review-2026-05-12.md`、`docs/releases/RELEASE_NOTES_*sub2api*`、Claude Code tool continuation / compact / provisional text 相关修复。
+  6. 把评审结论写入 `AGENTS.md`、`docs/fork-review-2026-05-12.md` 或新 release notes，确保后续 Agent 能追溯为什么合入或跳过。
+  7. 本地只做轻量验证；正式 Docker 镜像优先通过 GitHub Actions tag 构建，成功后再 `docker compose pull` 并部署。
+- 当前已发布并部署的基线版本：
+  - 本地版本：`v2.0.95-sub2api.1`
+  - 官方对齐基线：`v2.0.95`
+  - 镜像：`ghcr.io/zekza/windsurf-api:2.0.95-sub2api.1`
+  - 核心差异：保留 sub2api/Claude Code 专项修复；选择性集成 `#175` 和可选 sticky；跳过 Dashboard UI 大改。
+
 ## 暂不建议直接合并的功能
 
 以下功能有潜在价值，但不应在没有专项审计和验证的情况下直接合并：
