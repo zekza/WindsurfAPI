@@ -4,7 +4,7 @@ services:
     # `build:` is kept for local dev: `docker compose up --build` rebuilds from source,
     # and Compose will fall back to building when the image isn't available locally
     # AND can't be pulled (e.g. before the first stable tag exists, or on a fork).
-    image: ${WINDSURF_API_IMAGE:-ghcr.io/zekza/windsurf-api:2.0.94-sub2api.6}
+    image: ${WINDSURF_API_IMAGE:-ghcr.io/zekza/windsurf-api:2.0.95-sub2api.1}
     build:
       context: .
       dockerfile: Dockerfile
@@ -17,6 +17,15 @@ services:
       PORT: 3003
       DATA_DIR: /data
       LS_BINARY_PATH: /opt/windsurf/language_server_linux_x64
+      LS_DATA_DIR: /opt/windsurf/data
+      # Claude Code/sub2api: keep streamed summaries visible even when the
+      # same Anthropic turn later continues with stop_reason=tool_use.
+      ANTHROPIC_STREAM_PROVISIONAL_TEXT: ${ANTHROPIC_STREAM_PROVISIONAL_TEXT:-1}
+      # Optional same-account caller affinity. Default off because the
+      # cascade continuation pool is the primary Claude Code fix.
+      STICKY_SESSION_ENABLED: ${STICKY_SESSION_ENABLED:-0}
+      STICKY_SESSION_TTL_MS: ${STICKY_SESSION_TTL_MS:-1800000}
+      STICKY_SESSION_MAX: ${STICKY_SESSION_MAX:-10000}
       # REPLICA_ISOLATE=1 puts telemetry under per-container subdirs.
       # Default off — accounts.json now always lives at the shared
       # /data/accounts.json regardless of this flag (see src/config.js

@@ -160,9 +160,13 @@ DEFAULT_MODEL=claude-4.5-sonnet-thinking
 MAX_TOKENS=8192
 LOG_LEVEL=info
 LS_BINARY_PATH=/opt/windsurf/language_server_linux_x64
+LS_DATA_DIR=/opt/windsurf/data
 LS_PORT=42100
 DASHBOARD_PASSWORD=
 EOF
+
+# macOS 本地部署时，使用 install-ls.sh 打印的 LS_BINARY_PATH，
+# 并把 LS_DATA_DIR 设到用户可写目录，例如 /Users/you/.windsurf/data。
 
 node src/index.js
 ```
@@ -255,10 +259,15 @@ curl http://localhost:3003/v1/messages \
 | `DEFAULT_MODEL` | `claude-4.5-sonnet-thinking` | 不传 model 用哪个 |
 | `MAX_TOKENS` | `8192` | 默认最大回复 token 数 |
 | `LOG_LEVEL` | `info` | debug / info / warn / error |
-| `LS_BINARY_PATH` | `/opt/windsurf/language_server_linux_x64` | LS 二进制位置 |
+| `LS_BINARY_PATH` | Linux: `/opt/windsurf/language_server_linux_x64`；Linux arm64: `/opt/windsurf/language_server_linux_arm`；macOS: `~/.windsurf/language_server_macos_*` | LS 二进制位置 |
+| `LS_DATA_DIR` | Linux: `/opt/windsurf/data`；macOS: `~/.windsurf/data` | 每个 proxy 独立的 LS 数据根目录 |
 | `LS_PORT` | `42100` | LS gRPC 端口 |
 | `DASHBOARD_PASSWORD` | 空 | 后台密码 留空不设密码 |
 | `ALLOW_PRIVATE_PROXY_HOSTS` | 空 | 设为 `1` 允许在代理测试和登录时使用内网 IP（如 `192.168.x.x`、`10.x.x.x`）。默认留空仅允许公网地址 |
+| `ANTHROPIC_STREAM_PROVISIONAL_TEXT` | `1` | Claude Code/sub2api 场景下放开 `tool_use` 中间文本，保留阶段性总结可见 |
+| `STICKY_SESSION_ENABLED` | `0` | 可选同 caller/model 账号亲和；默认关闭，主修复仍是 cascade continuation pool |
+| `STICKY_SESSION_TTL_MS` | `1800000` | sticky 绑定 TTL |
+| `STICKY_SESSION_MAX` | `10000` | sticky 绑定最大数量 |
 
 ## Dashboard 功能面板
 

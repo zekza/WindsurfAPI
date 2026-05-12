@@ -529,6 +529,8 @@ describe('Anthropic messages request translation', () => {
   });
 
   it('does not stream provisional text in a tool_use turn', async () => {
+    const prev = process.env.ANTHROPIC_STREAM_PROVISIONAL_TEXT;
+    delete process.env.ANTHROPIC_STREAM_PROVISIONAL_TEXT;
     const result = await handleMessages({
       model: 'claude-sonnet-4.6',
       stream: true,
@@ -550,20 +552,70 @@ describe('Anthropic messages request translation', () => {
       },
     });
 
-    const res = fakeRes();
-    await result.handler(res);
-    const events = parseAnthropicEvents(res.body);
-    assert.equal(
-      events.some(e => e.event === 'content_block_delta' && e.data.delta?.type === 'text_delta'),
-      false,
-      'tool_use turns must not expose provisional text as final-looking output'
-    );
-    assert.equal(
-      events.some(e => e.event === 'content_block_start' && e.data.content_block?.type === 'tool_use'),
-      true
-    );
-    const stop = events.find(e => e.event === 'message_delta');
-    assert.equal(stop.data.delta.stop_reason, 'tool_use');
+    try {
+      const res = fakeRes();
+      await result.handler(res);
+      const events = parseAnthropicEvents(res.body);
+      assert.equal(
+        events.some(e => e.event === 'content_block_delta' && e.data.delta?.type === 'text_delta'),
+        false,
+        'tool_use turns must not expose provisional text as final-looking output by default'
+      );
+      assert.equal(
+        events.some(e => e.event === 'content_block_start' && e.data.content_block?.type === 'tool_use'),
+        true
+      );
+      const stop = events.find(e => e.event === 'message_delta');
+      assert.equal(stop.data.delta.stop_reason, 'tool_use');
+    } finally {
+      if (prev === undefined) delete process.env.ANTHROPIC_STREAM_PROVISIONAL_TEXT;
+      else process.env.ANTHROPIC_STREAM_PROVISIONAL_TEXT = prev;
+    }
+  });
+
+  it('can stream provisional text in a tool_use turn when enabled', async () => {
+    const prev = process.env.ANTHROPIC_STREAM_PROVISIONAL_TEXT;
+    process.env.ANTHROPIC_STREAM_PROVISIONAL_TEXT = '1';
+    const result = await handleMessages({
+      model: 'claude-sonnet-4.6',
+      stream: true,
+      tools: [{ name: 'Read', description: 'read files', input_schema: { type: 'object' } }],
+      messages: [{ role: 'user', content: 'check project' }],
+    }, {
+      async handleChatCompletions() {
+        return {
+          status: 200,
+          stream: true,
+          async handler(res) {
+            res.write(chatChunk({ choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }] }));
+            res.write(chatChunk({ choices: [{ index: 0, delta: { content: '阶段性总结：看起来已经完成。' }, finish_reason: null }] }));
+            res.write(chatChunk({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: 'call_1', function: { name: 'Read', arguments: '{"file_path":"server.js"}' } }] }, finish_reason: null }] }));
+            res.write(chatChunk({ choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] }));
+            res.end('data: [DONE]\n\n');
+          },
+        };
+      },
+    });
+
+    try {
+      const res = fakeRes();
+      await result.handler(res);
+      const events = parseAnthropicEvents(res.body);
+      const text = events
+        .filter(e => e.event === 'content_block_delta' && e.data.delta?.type === 'text_delta')
+        .map(e => e.data.delta.text)
+        .join('');
+      assert.equal(text, '阶段性总结：看起来已经完成。');
+      assert.equal(
+        events.some(e => e.event === 'content_block_start' && e.data.content_block?.type === 'tool_use'),
+        true
+      );
+      const stop = events.find(e => e.event === 'message_delta');
+      assert.equal(stop.data.delta.stop_reason, 'tool_use');
+    } finally {
+      if (prev === undefined) delete process.env.ANTHROPIC_STREAM_PROVISIONAL_TEXT;
+      else process.env.ANTHROPIC_STREAM_PROVISIONAL_TEXT = prev;
+    }
   });
 
   it('still streams text when the turn ends normally', async () => {

@@ -6,6 +6,7 @@
 import { createHash, randomUUID } from 'crypto';
 import { WindsurfClient, contentToString, isCascadeTransportError } from '../client.js';
 import { getApiKey, acquireAccountByKey, releaseAccount, getAccountAvailability, reportError, reportSuccess, markRateLimited, reportInternalError, updateCapability, getAccountList, isAllRateLimited, isAllTemporarilyUnavailable, refundReservation, looksLikeBanSignal, reportBanSignal, clearBanSignals, isModelBlockedByDrought, getDroughtSummary } from '../auth.js';
+import { isStickyEnabled, setStickyBinding } from '../account/sticky-session.js';
 import { resolveModel, getModelInfo, pickRateLimitFallback } from '../models.js';
 import { getLsFor, ensureLs } from '../langserver.js';
 import { config, log } from '../config.js';
@@ -1163,14 +1164,14 @@ export function buildUsageBody(serverUsage, messages, completionText, thinkingTe
 // Wait until getApiKey returns a non-null account, or until maxWaitMs expires.
 // Used when every account has momentarily exhausted its RPM budget so the
 // client is queued instead of getting a 503.
-async function waitForAccount(tried, signal, maxWaitMs = QUEUE_MAX_WAIT_MS, modelKey = null) {
+async function waitForAccount(tried, signal, maxWaitMs = QUEUE_MAX_WAIT_MS, modelKey = null, callerKey = null) {
   const deadline = Date.now() + maxWaitMs;
-  let acct = getApiKey(tried, modelKey);
+  let acct = getApiKey(tried, modelKey, callerKey);
   while (!acct) {
     if (signal?.aborted) return null;
     if (Date.now() >= deadline) return null;
     await new Promise(r => setTimeout(r, QUEUE_RETRY_MS));
-    acct = getApiKey(tried, modelKey);
+    acct = getApiKey(tried, modelKey, callerKey);
   }
   return acct;
 }
@@ -1900,7 +1901,7 @@ async function _handleChatCompletionsInner(body, context = {}) {
       }
     }
     if (!acct) {
-      acct = await waitForAccountFn(tried, null, QUEUE_MAX_WAIT_MS, routingModelKey);
+      acct = await waitForAccountFn(tried, null, QUEUE_MAX_WAIT_MS, routingModelKey, callerKey);
       if (!acct) {
         // Same diagnostic-error fix as the stream path — surface real reason
         // for the queue timeout (rate limit / no entitlement / upstream stall)
@@ -1996,7 +1997,7 @@ async function _handleChatCompletionsInner(body, context = {}) {
       // when this handler is the second pass of an auto-fallback
       // retry; it carries the ORIGINAL model name the client asked
       // for so the cascade pool entry gets indexed under both keys.
-      reuseEnabled ? { reuseEntry, lsPort: ls.port, apiKey: acct.apiKey, callerKey, cachePolicy, fpOpts, aliasModelKey: context.__aliasModelKey || null } : null,
+      reuseEnabled ? { reuseEntry, lsPort: ls.port, apiKey: acct.apiKey, accountId: acct.id, callerKey, cachePolicy, fpOpts, aliasModelKey: context.__aliasModelKey || null } : null,
       modelInfo?.provider || null,
       emulateTools, toolPreamble, wantJson, cachePolicy, wantThinking, tools, body.__route || 'chat',
       nativeOpts,
@@ -2459,6 +2460,12 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
         historyCoverage: cascadeMeta.historyCoverage || poolCtx.reuseEntry?.historyCoverage || null,
         createdAt: poolCtx.reuseEntry?.createdAt,
       }, poolCtx.callerKey || '', ttlHint === undefined ? 0 : ttlHint);
+
+      // Optional safety net: keep this caller on the last successful
+      // upstream account. The cascade continuation pool remains primary.
+      if (poolCtx.callerKey && poolCtx.accountId && isStickyEnabled()) {
+        setStickyBinding(poolCtx.callerKey, modelKey, poolCtx.accountId, poolCtx.apiKey);
+      }
     }
 
     reportSuccess(apiKey);
@@ -2972,7 +2979,7 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
             }
           }
           if (!acct) {
-            acct = await waitForAccountFn(tried, abortController.signal, QUEUE_MAX_WAIT_MS, modelKey);
+            acct = await waitForAccountFn(tried, abortController.signal, QUEUE_MAX_WAIT_MS, modelKey, callerKey);
             if (!acct) {
               // Without an explicit lastErr here, the final retry-failed log
               // ends up printing an empty message and the SSE error event
@@ -3211,6 +3218,12 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
                 historyCoverage: cascadeResult.historyCoverage || reuseEntry?.historyCoverage || null,
                 createdAt: reuseEntry?.createdAt,
               }, callerKey, ttlHint === undefined ? 0 : ttlHint);
+
+              // Optional safety net for stream:true clients such as
+              // Claude Code. Disabled unless STICKY_SESSION_ENABLED=1.
+              if (callerKey && isStickyEnabled() && acct) {
+                setStickyBinding(callerKey, modelKey, acct.id, acct.apiKey);
+              }
             }
             // success
             if (hadSuccess) reportSuccess(currentApiKey);

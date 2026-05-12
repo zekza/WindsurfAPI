@@ -72,10 +72,25 @@
 
 ## PR 评估结论
 
-- `#163 feat: auto-restart crashed language server with exponential backoff`：已适配合入。
-- `#162 feat: sticky session for multi-turn conversation continuity`：暂不合入。它默认关闭但改动账号选择链路；当前仓库已有 `callerKey`、conversation pool 和 `acquireAccountByKey()` 复用机制，后续若要合并需做会话池专项审计。
+- `#163 feat: auto-restart crashed language server with exponential backoff`：已适配合入；官方 `v2.0.95` 的同类更新不再重复合并。
+- `#162 feat: sticky session for multi-turn conversation continuity`：已选择性合入为可选兜底，默认关闭。当前实现优先保留 `v2.0.94-sub2api.6` 的 cascade continuation pool 修复，并额外避免 sticky 在重试时选中 `excludeKeys/tried` 里的账号。
 - `#173 refactor(dashboard): UI cleanup`：暂不合入。控制台 UI 大改，和 Claude Code/sub2api 主路径无关。
+- `#175 fix: cross-platform language server paths`：已选择性合入。Linux arm64 / macOS 默认 LS 路径和 `LS_DATA_DIR` 与运行时、安装脚本、测试保持一致。
 - `#161 fix(dashboard): dashboard account management page width adaptive`：不合入。该 PR 同时注释掉私网 IP 检查，会削弱安全边界。
+
+## 当前上游同步状态
+
+- 官方上游 `v2.0.95` 包含：
+  - `#162` sticky session
+  - `#163` LS auto-restart
+  - `#173` Dashboard UI cleanup
+  - `#175` cross-platform LS paths
+- 本仓库不要整体 merge `origin/master`，否则会删除或覆盖本地 sub2api 文档、release notes 和 Claude Code 专项修复。
+- 当前选择性集成策略：
+  - 合入 `#175`。
+  - 合入 `#162` 的思路但默认关闭，并保留本地更严格的账号排除逻辑。
+  - 跳过 `#173`。
+  - 跳过官方 `#163`，因为本地已有等价实现。
 
 ## 暂不建议直接合并的功能
 
@@ -86,10 +101,6 @@
   - 相关提交：`ed55a5c`, `f7fed1b`, `79a1608`, `5e3ba04`
   - 可能改善 Claude Code 连续工具调用、复用 MISS、冷启动无输出重试等问题。
   - 风险：会改变 `conversation-pool` 复用语义；后续若再次出现 Claude Code 连续性异常，应单独审计这组改动。
-- Sticky Session：
-  - 来源：`dwgx/WindsurfAPI#162` / `you922/WindsurfAPI`
-  - 价值：绑定 caller/model 到同一账号，理论上可改善多轮会话换号导致的上下文丢失。
-  - 风险：改动账号选择链路，和当前 conversation pool 机制重叠；不要在没有专项测试时直接合入。
 - 限流直接返回 429：
   - 来源：`LeevianChang/WindsurfAPI` 的 `AUTO_DISABLE_RATE_LIMITED`
   - 价值：共用代理被整体限流时，避免连续尝试多个账号。

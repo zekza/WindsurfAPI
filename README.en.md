@@ -163,9 +163,14 @@ DEFAULT_MODEL=claude-4.5-sonnet-thinking
 MAX_TOKENS=8192
 LOG_LEVEL=info
 LS_BINARY_PATH=/opt/windsurf/language_server_linux_x64
+LS_DATA_DIR=/opt/windsurf/data
 LS_PORT=42100
 DASHBOARD_PASSWORD=
 EOF
+
+# For local macOS deployments, use the LS_BINARY_PATH printed by
+# install-ls.sh and set LS_DATA_DIR to a user-writable directory,
+# for example /Users/you/.windsurf/data.
 
 # Note: Inline comments are supported in .env for unquoted values:
 #   PORT=3003  # Service port
@@ -264,14 +269,18 @@ In your client's settings for **Custom OpenAI Compatible**:
 | `DEFAULT_MODEL` | `claude-4.5-sonnet-thinking` | The model to use if `model` is not specified. |
 | `MAX_TOKENS` | `8192` | Default maximum number of response tokens. |
 | `LOG_LEVEL` | `info` | debug / info / warn / error |
-| `LS_BINARY_PATH` | `/opt/windsurf/language_server_linux_x64` | Path to the LS binary. |
+| `LS_BINARY_PATH` | Linux: `/opt/windsurf/language_server_linux_x64`; Linux arm64: `/opt/windsurf/language_server_linux_arm`; macOS: `~/.windsurf/language_server_macos_*` | Path to the LS binary. |
 | `LS_PORT` | `42100` | LS gRPC port. |
-| `LS_DATA_DIR` | `/opt/windsurf` | Per-proxy LS data directory root. |
+| `LS_DATA_DIR` | Linux: `/opt/windsurf/data`; macOS: `~/.windsurf/data` | Per-proxy LS data directory root. |
 | `DASHBOARD_PASSWORD` | empty | Dashboard password. Leave empty for no password. |
 | `ALLOW_PRIVATE_PROXY_HOSTS` | empty | Set to `1` to allow private/internal IPs (e.g., `192.168.x.x`, `10.x.x.x`) in proxy tests and login. Leave empty to only allow public addresses (default). |
 | `CASCADE_REUSE_STRICT` | `0` | Set to `1` for strict conversation reuse mode (waits for same fingerprint). |
 | `CASCADE_REUSE_STRICT_RETRY_MS` | `60000` | Retry delay in ms for strict reuse mode. |
 | `CASCADE_REUSE_HASH_SYSTEM` | `0` | Set to `1` to include system messages in conversation reuse hash. |
+| `ANTHROPIC_STREAM_PROVISIONAL_TEXT` | `1` | Claude Code/sub2api tuning: stream provisional text even if the same Anthropic turn later ends with `tool_use`. |
+| `STICKY_SESSION_ENABLED` | `0` | Optional same caller/model account affinity. Default off; the cascade continuation pool remains the primary fix. |
+| `STICKY_SESSION_TTL_MS` | `1800000` | Sticky binding TTL in ms. |
+| `STICKY_SESSION_MAX` | `10000` | Maximum sticky bindings. |
 
 ## Dashboard Features
 

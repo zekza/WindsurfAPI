@@ -827,8 +827,9 @@ export async function handleMessages(body, context = {}) {
     },
     async handler(realRes) {
       const hasClientTools = Array.isArray(body.tools) && body.tools.length > 0;
+      const allowProvisionalText = process.env.ANTHROPIC_STREAM_PROVISIONAL_TEXT === '1';
       const translator = new AnthropicStreamTranslator(realRes, msgId, requestedModel, {
-        bufferTextUntilStop: hasClientTools && !forceTextResponse,
+        bufferTextUntilStop: hasClientTools && !forceTextResponse && !allowProvisionalText,
       });
       const captureRes = createCaptureRes(translator, realRes);
 
