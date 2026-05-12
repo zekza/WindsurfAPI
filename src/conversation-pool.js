@@ -429,6 +429,42 @@ function buildKeyPayload({ messages, modelKey, callerKey, opts, scope }) {
   });
 }
 
+function latestRealUserProjection(messages) {
+  if (!Array.isArray(messages)) return null;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m?.role !== 'user') continue;
+    const blocks = canonicaliseContent(m.content);
+    if (hasUnhashableMedia(blocks)) return null;
+    const text = blocks
+      .filter(b => b.type === 'text')
+      .map(b => String(b.text || '').trim())
+      .join('\n')
+      .trim();
+    // Synthetic tool_result wrappers are user turns after normalization, but
+    // they are not the real task anchor. Skip them when deriving the sticky
+    // continuation key for Claude Code tool_result loops.
+    if (/^<tool_result\b/i.test(text)) continue;
+    return { role: 'user', content: blocks };
+  }
+  return null;
+}
+
+function continuationKey(messages, modelKey = '', callerKey = '', opts = {}) {
+  const user = latestRealUserProjection(messages);
+  if (!user) return null;
+  return sha256(stableStringify({
+    v: KEY_VERSION,
+    kind: 'tool-continuation',
+    caller: String(callerKey || ''),
+    model: String(modelKey || ''),
+    route: opts?.route || 'chat',
+    sys: systemDigest(messages),
+    tools: toolContextDigest(opts),
+    latest_user: user,
+  }));
+}
+
 /**
  * Fingerprint for "I'm about to send this newest user turn — find me a
  * cascade I can resume." Hashes everything before the newest user/tool
@@ -474,6 +510,10 @@ export function fingerprintAfter(messages, modelKey = '', callerKey = '', opts =
     tools,
     turns: projection.turns,
   }));
+}
+
+export function continuationFingerprint(messages, modelKey = '', callerKey = '', opts = {}) {
+  return continuationKey(messages, modelKey, callerKey, opts);
 }
 
 function effectiveTtl(entry) {
@@ -542,6 +582,28 @@ export function checkout(fingerprint, callerKey = '', expected = null) {
   return entry;
 }
 
+export function checkoutLatestContinuation(messages, modelKey = '', callerKey = '', opts = {}) {
+  const key = continuationKey(messages, modelKey, callerKey, opts);
+  if (!key) { stats.misses++; return null; }
+  const now = Date.now();
+  let bestFp = null;
+  let best = null;
+  for (const [fp, entry] of _pool) {
+    if (!entry || entry.continuationKey !== key) continue;
+    if (entry.callerKey && callerKey && entry.callerKey !== callerKey) continue;
+    if (now - entry.lastAccess > effectiveTtl(entry)) continue;
+    if (!best || entry.lastAccess > best.lastAccess) {
+      bestFp = fp;
+      best = entry;
+    }
+  }
+  if (!bestFp || !best) { stats.misses++; return null; }
+  _pool.delete(bestFp);
+  stats.hits++;
+  stats.continuationHits = (stats.continuationHits || 0) + 1;
+  return best;
+}
+
 /**
  * Store (or restore) a conversation entry under a new fingerprint.
  *
@@ -588,6 +650,7 @@ export function checkin(fingerprint, entry, callerKey = '', ttlHintMs) {
       lsGeneration: entry.lsGeneration,
       apiKey: entry.apiKey,
       callerKey: callerKey || entry.callerKey || '',
+      continuationKey: entry.continuationKey || null,
       stepOffset: Number.isFinite(entry.stepOffset) ? entry.stepOffset : 0,
       generatorOffset: Number.isFinite(entry.generatorOffset) ? entry.generatorOffset : 0,
       historyCoverage: entry.historyCoverage || null,

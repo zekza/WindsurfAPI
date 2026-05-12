@@ -1,6 +1,9 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { fingerprintBefore, fingerprintAfter, checkout, checkin, poolStats, poolClear, invalidateFor } from '../src/conversation-pool.js';
+import {
+  fingerprintBefore, fingerprintAfter, continuationFingerprint,
+  checkout, checkoutLatestContinuation, checkin, poolStats, poolClear, invalidateFor,
+} from '../src/conversation-pool.js';
 
 describe('fingerprintBefore', () => {
   it('returns null for single-message conversations', () => {
@@ -278,6 +281,44 @@ describe('checkout / checkin', () => {
     checkin(fp, { cascadeId: 'c-own', sessionId: 's', lsPort: 42100, apiKey: 'key-A', lsGeneration: 'gen1' });
     const ok = checkout(fp, '', { apiKey: 'key-A', lsPort: 42100, lsGeneration: 'gen1' });
     assert.equal(ok?.cascadeId, 'c-own', 'matching owner should hit');
+  });
+
+  it('falls back to latest continuation entry for tool_result loops when exact fingerprint drifts', () => {
+    poolClear();
+    const caller = 'api:shared:user:same';
+    const model = 'claude-opus-4.6-thinking';
+    const fpOpts = {
+      route: 'messages',
+      emulateTools: true,
+      tools: [{ function: { name: 'Read', description: 'read file', parameters: { type: 'object' } } }],
+    };
+    const firstTurn = [
+      { role: 'system', content: 'stable system prompt' },
+      { role: 'user', content: '检查下项目有什么问题吗' },
+      { role: 'assistant', content: null, tool_calls: [{ function: { name: 'Read', arguments: '{"file_path":"package.json"}' } }] },
+    ];
+    const exactStored = fingerprintAfter(firstTurn, model, caller, fpOpts);
+    checkin(exactStored, {
+      cascadeId: 'cascade-tool-loop',
+      sessionId: 'session-tool-loop',
+      lsPort: 42100,
+      apiKey: 'key-original',
+      continuationKey: continuationFingerprint(firstTurn, model, caller, fpOpts),
+    }, caller);
+
+    const nextTurnWithDrift = [
+      { role: 'system', content: 'stable system prompt' },
+      { role: 'user', content: '检查下项目有什么问题吗' },
+      { role: 'assistant', content: 'minor provisional text that changed', tool_calls: [{ function: { name: 'Read', arguments: '{"file_path":"package.json"}' } }] },
+      { role: 'tool', tool_call_id: 'toolu_1', content: '{"ok":true}' },
+    ];
+    const exactNext = fingerprintBefore(nextTurnWithDrift, model, caller, fpOpts);
+    assert.notEqual(exactNext, exactStored, 'setup must simulate exact fingerprint drift');
+    assert.equal(checkout(exactNext, caller), null, 'exact checkout should miss');
+
+    const recovered = checkoutLatestContinuation(nextTurnWithDrift, model, caller, fpOpts);
+    assert.equal(recovered?.cascadeId, 'cascade-tool-loop');
+    assert.equal(recovered?.apiKey, 'key-original');
   });
 });
 

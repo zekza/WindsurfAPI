@@ -18,7 +18,8 @@ import { isExperimentalEnabled } from '../runtime-config.js';
 import { checkMessageRateLimit } from '../windsurf-api.js';
 import { getEffectiveProxy } from '../dashboard/proxy-config.js';
 import {
-  fingerprintBefore, fingerprintAfter, checkout as poolCheckout, checkin as poolCheckin,
+  fingerprintBefore, fingerprintAfter, continuationFingerprint,
+  checkout as poolCheckout, checkoutLatestContinuation, checkin as poolCheckin,
 } from '../conversation-pool.js';
 import {
   normalizeMessagesForCascade, ToolCallStreamParser, parseToolCallsFromText, stripToolMarkupFromText,
@@ -114,6 +115,10 @@ function toolHistoryStats(messages) {
     }
   }
   return stats;
+}
+
+function hasToolContinuation(stats) {
+  return !!stats && (stats.toolResults > 0 || stats.assistantToolCalls > 0);
 }
 
 // v2.0.55 (audit M2): salvage parser will accept any
@@ -1817,6 +1822,12 @@ async function _handleChatCompletionsInner(body, context = {}) {
   const fpOpts = buildReuseOpts({ tools, toolChoice: tool_choice, toolPreamble, preambleTier: preambleTier || null, emulateTools, route: body.__route || 'chat' });
   const fpBefore = reuseEnabled ? fingerprintBefore(messages, routingModelKey, callerKey, fpOpts) : null;
   let reuseEntry = reuseEnabled ? poolCheckout(fpBefore, callerKey) : null;
+  if (reuseEnabled && !reuseEntry && hasToolContinuation(initialToolStats)) {
+    reuseEntry = checkoutLatestContinuation(messages, routingModelKey, callerKey, fpOpts);
+    if (reuseEntry) {
+      log.info(`Chat[${reqId}]: reuse continuation HIT cascade=${reuseEntry.cascadeId.slice(0, 8)} owner=${shortHash(reuseEntry.apiKey || '')} caller=${callerTag}`);
+    }
+  }
   let checkedOutReuseEntry = reuseEntry;
   // v2.0.71 (#116 zhangzhang-bit follow-up): structured reuse log so
   // operators can see whether multi-turn cascades are actually reusing
@@ -2442,6 +2453,7 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
         lsPort: poolCtx.lsPort,
         lsGeneration: cascadeMeta.lsGeneration || poolCtx.lsGeneration,
         apiKey: poolCtx.apiKey,
+        continuationKey: continuationFingerprint(turnComplete, modelKey, poolCtx.callerKey || '', poolCtx.fpOpts),
         stepOffset: Number.isFinite(cascadeMeta.stepOffset) ? cascadeMeta.stepOffset : poolCtx.reuseEntry?.stepOffset,
         generatorOffset: Number.isFinite(cascadeMeta.generatorOffset) ? cascadeMeta.generatorOffset : poolCtx.reuseEntry?.generatorOffset,
         historyCoverage: cascadeMeta.historyCoverage || poolCtx.reuseEntry?.historyCoverage || null,
@@ -2746,6 +2758,13 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
       let checkedOutReuseEntry = reuseEntry;
       const callerTag = callerKey ? shortHash(callerKey) : 'none';
       const streamToolStats = toolHistoryStats(messages);
+      if (reuseEnabled && !reuseEntry && hasToolContinuation(streamToolStats)) {
+        reuseEntry = checkoutLatestContinuation(messages, modelKey, callerKey, fpOpts);
+        checkedOutReuseEntry = reuseEntry;
+        if (reuseEntry) {
+          log.info(`Chat[${reqId}]: reuse continuation HIT cascade=${reuseEntry.cascadeId.slice(0, 8)} owner=${shortHash(reuseEntry.apiKey || '')} caller=${callerTag} stream=1`);
+        }
+      }
       if (reuseEnabled) {
         log.info(`Chat[${reqId}]: reuse fp=${fpBefore?.slice(0, 12) || 'none'} ${reuseEntry ? `HIT cascade=${reuseEntry.cascadeId.slice(0, 8)} owner=${shortHash(reuseEntry.apiKey || '')}` : 'MISS'} caller=${callerTag} stream=1 turns=${(messages || []).length} toolResults=${streamToolStats.toolResults} assistantToolCalls=${streamToolStats.assistantToolCalls} model=${modelKey}`);
       } else if (sharedApiKeyNoScopeStream) {
@@ -3186,6 +3205,7 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
                 lsPort: ls.port,
                 lsGeneration: cascadeResult.lsGeneration || ls.generation,
                 apiKey: currentApiKey,
+                continuationKey: continuationFingerprint(turnComplete, modelKey, callerKey, fpOpts),
                 stepOffset: Number.isFinite(cascadeResult.stepOffset) ? cascadeResult.stepOffset : reuseEntry?.stepOffset,
                 generatorOffset: Number.isFinite(cascadeResult.generatorOffset) ? cascadeResult.generatorOffset : reuseEntry?.generatorOffset,
                 historyCoverage: cascadeResult.historyCoverage || reuseEntry?.historyCoverage || null,
