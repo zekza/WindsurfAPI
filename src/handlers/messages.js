@@ -435,10 +435,11 @@ function buildAnthropicUsage(usage) {
 // ─── Streaming translator: intercepts OpenAI SSE, emits Anthropic SSE ──
 
 class AnthropicStreamTranslator {
-  constructor(res, msgId, model) {
+  constructor(res, msgId, model, opts = {}) {
     this.res = res;
     this.msgId = msgId;
     this.model = model;
+    this.bufferTextUntilStop = !!opts.bufferTextUntilStop;
     // Current content block: null | { type, index }
     // type: 'text' | 'thinking' | 'tool_use'
     this.current = null;
@@ -449,6 +450,8 @@ class AnthropicStreamTranslator {
     this.messageStarted = false;
     this.messageStopped = false;
     this.pendingSseBuf = '';
+    this.bufferedText = '';
+    this.bufferedThinking = '';
   }
 
   send(event, data) {
@@ -512,6 +515,16 @@ class AnthropicStreamTranslator {
     });
   }
 
+  bufferTextDelta(text) {
+    if (text) this.bufferedText += text;
+  }
+
+  flushBufferedText() {
+    const text = this.bufferedText;
+    this.bufferedText = '';
+    if (text) this.emitTextDelta(text);
+  }
+
   emitThinkingDelta(text) {
     if (!text) return;
     if (this.current?.type !== 'thinking') this.startBlock('thinking');
@@ -520,6 +533,16 @@ class AnthropicStreamTranslator {
       index: this.current.index,
       delta: { type: 'thinking_delta', thinking: text },
     });
+  }
+
+  bufferThinkingDelta(text) {
+    if (text) this.bufferedThinking += text;
+  }
+
+  flushBufferedThinking() {
+    const text = this.bufferedThinking;
+    this.bufferedThinking = '';
+    if (text) this.emitThinkingDelta(text);
   }
 
   emitToolCallDelta(toolCall) {
@@ -574,8 +597,14 @@ class AnthropicStreamTranslator {
     const choice = chunk.choices?.[0];
     if (choice) {
       const delta = choice.delta || {};
-      if (delta.reasoning_content) this.emitThinkingDelta(delta.reasoning_content);
-      if (delta.content) this.emitTextDelta(delta.content);
+      if (delta.reasoning_content) {
+        if (this.bufferTextUntilStop) this.bufferThinkingDelta(delta.reasoning_content);
+        else this.emitThinkingDelta(delta.reasoning_content);
+      }
+      if (delta.content) {
+        if (this.bufferTextUntilStop) this.bufferTextDelta(delta.content);
+        else this.emitTextDelta(delta.content);
+      }
       if (Array.isArray(delta.tool_calls)) {
         for (const tc of delta.tool_calls) this.emitToolCallDelta(tc);
       }
@@ -596,6 +625,20 @@ class AnthropicStreamTranslator {
     // sequence. Without this, the client sees message_delta + stop
     // with no preceding start and reports "Content block not found".
     if (!this.messageStarted) this.startMessage();
+    // Claude Code treats `stop_reason=tool_use` as an intermediate tool
+    // turn. If we stream model prose before the tool_use block, the client
+    // displays a "summary" that was never final, then feeds tool_result back
+    // and the model keeps going. Hold text/thinking until we know the final
+    // stop reason; only flush it for real end_turn/max_tokens responses.
+    if (!this.bufferTextUntilStop) {
+      // Text/thinking already streamed live.
+    } else if (this.stopReason !== 'tool_use') {
+      this.flushBufferedThinking();
+      this.flushBufferedText();
+    } else {
+      this.bufferedThinking = '';
+      this.bufferedText = '';
+    }
     this.closeCurrentBlock();
     const u = this.finalUsage || {};
     this.send('message_delta', {
@@ -783,7 +826,10 @@ export async function handleMessages(body, context = {}) {
       'X-Accel-Buffering': 'no',
     },
     async handler(realRes) {
-      const translator = new AnthropicStreamTranslator(realRes, msgId, requestedModel);
+      const hasClientTools = Array.isArray(body.tools) && body.tools.length > 0;
+      const translator = new AnthropicStreamTranslator(realRes, msgId, requestedModel, {
+        bufferTextUntilStop: hasClientTools && !forceTextResponse,
+      });
       const captureRes = createCaptureRes(translator, realRes);
 
       // Forward client disconnect so the upstream cascade is cancelled.
